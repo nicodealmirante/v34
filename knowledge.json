@@ -1,0 +1,24 @@
+[
+  {
+    "q": "precio del modelo slim",
+    "patterns": [
+      "\\bprecio\\b.*\\bslim\\b",
+      "\\bcompr(ar|a)\\b.*\\bslim\\b"
+    ],
+    "a": "El **Modelo SLIM** cuesta **USD 3000**. Seña del 10% para reservar, saldo antes de la entrega."
+  },
+  {
+    "q": "formas de pago",
+    "patterns": [
+      "\\b(pagos?|cuotas?|mercado pago|transferencia)\\b"
+    ],
+    "a": "Transferencia, Mercado Pago y dólares billete. Seña **10%** para bloquear fecha."
+  },
+  {
+    "q": "plazo de entrega",
+    "patterns": [
+      "\\b(entrega|plazo|demora)\\b"
+    ],
+    "a": "Entrega típica **5–10 días hábiles** desde la seña. Envíos se confirman los lunes."
+  }
+]
