@@ -1,21 +1,21 @@
-# syntax=docker/dockerfile:1.7
 FROM node:20-alpine
+
 WORKDIR /app
 
-RUN apk add --no-cache git ca-certificates \
- && git config --global url."https://github.com/".insteadOf "git@github.com:"
+# Git (para deps desde Git) + certs
+RUN apk add --no-cache git ca-certificates
 
-# clave de cache (podés setearla en el build)
-ARG CACHE_KEY=default
+# Si alguna dep usa SSH (git@github.com:...), forzá HTTPS para evitar llaves
+RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+# Manifiestos primero (cache de capas)
 COPY package*.json ./
 
-RUN --mount=type=cache,id=${CACHE_KEY}/npm,target=/root/.npm \
-    if [ -f package-lock.json ]; then \
-      npm ci --omit=dev --no-audit --no-fund; \
-    else \
-      npm install --omit=dev --no-audit --no-fund; \
-    fi
+# Instalar deps (sin mounts, sin audit/fund)
+RUN npm install --omit=dev --no-audit --no-fund
 
+# Código
 COPY . .
+
 EXPOSE 3000
 CMD ["node","app.js"]
