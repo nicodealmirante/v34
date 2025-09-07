@@ -1,10 +1,11 @@
-import 'dotenv/config'
+\
+/* app.js — Luna + Grupo de Supervisores (Baileys) v1.3 */
 import express from 'express'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
-import mime from 'mime-types'
 import QRCode from 'qrcode'
+import mime from 'mime-types'
 import makeWASocket, {
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
@@ -13,111 +14,206 @@ import makeWASocket, {
 } from '@whiskeysockets/baileys'
 
 const app = express()
-app.use(express.json({ limit: '12mb' }))
+app.use(express.json({ limit: '4mb' }))
 
-const {
-  CHATWOOT_URL,
-  CHATWOOT_ACCOUNT_ID,
-  CHATWOOT_API_TOKEN,
-  WEBHOOK_SECRET,
-  // Supervisores Baileys (coma, sin +, solo dígitos)
-  SUPERVISORS = '',
-  BRAND_NAME = 'Selfie Mirror'
-} = process.env
+const CW_URL   = process.env.CHATWOOT_URL
+const CW_ACC   = process.env.CHATWOOT_ACCOUNT_ID
+const CW_TOKEN = process.env.CHATWOOT_API_TOKEN
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 
-if (!CHATWOOT_URL || !CHATWOOT_ACCOUNT_ID || !CHATWOOT_API_TOKEN) {
-  console.error('Faltan variables CHATWOOT_* en .env')
-  process.exit(1)
+const BRAND_NAME  = process.env.BRAND_NAME || 'Selfie Mirror'
+const LUNA_NAME   = process.env.LUNA_NAME || 'Luna'
+
+let SUPERVISOR_GROUP = (process.env.SUPERVISOR_GROUP || '').trim()
+const SUPERVISOR_GROUP_LINK = (process.env.SUPERVISOR_GROUP_LINK || '').trim()
+
+const DEFAULT_TTL_DAYS = Number(process.env.DEFAULT_TTL_DAYS || 180)
+const PRICE_TTL_DAYS   = Number(process.env.PRICE_TTL_DAYS || 30)
+
+if (!CW_URL || !CW_ACC || !CW_TOKEN) {
+  throw new Error('Faltan ENV: CHATWOOT_URL, CHATWOOT_ACCOUNT_ID, CHATWOOT_API_TOKEN')
 }
+const CW_BASE = `${CW_URL}/api/v1/accounts/${CW_ACC}`
 
-function onlyDigits (s) { return (s || '').replace(/\D+/g,'') }
-const SUPS = new Set( SUPERVISORS.split(',').map(s => onlyDigits(s)).filter(Boolean) )
+const stateFile = path.join(process.cwd(), 'state.json')
+let state = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile, 'utf8')) : {}
+if (!state.__rr || typeof state.__rr.i !== 'number') state.__rr = { i:0 }
 
-/* ================== Chatwoot helpers ================== */
-const hmacOk = (raw, sig) => {
-  if (!WEBHOOK_SECRET) return true
-  if (!sig) return false
-  const mac = crypto.createHmac('sha256', WEBHOOK_SECRET).update(raw).digest('hex')
-  return crypto.timingSafeEqual(Buffer.from(mac), Buffer.from(sig))
-}
-const CW_MSG_URL = (conversationId) =>
-  `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`
-
-function formDataFrom(fields) {
-  const fd = new FormData()
-  for (const [k,v] of Object.entries(fields||{})) {
-    if (v === undefined || v === null) continue
-    fd.append(k, typeof v === 'string' ? v : JSON.stringify(v))
+function touch(convId) {
+  if (!state[convId]) state[convId] = {
+    muted:false, greeted:false, lastTouch:Date.now(),
+    lastAtajo: null,
+    form: null,
+    supActive: false,
+    pendingQ: null,
+    answeredAt: 0
   }
-  return fd
+  state[convId].lastTouch = Date.now()
+  return state[convId]
 }
+function saveState(){ fs.writeFileSync(stateFile, JSON.stringify(state, null, 2)) }
 
-async function cwReplyText(conversationId, content) {
-  const r = await fetch(CW_MSG_URL(conversationId), {
-    method: 'POST',
-    headers: { 'api_access_token': CHATWOOT_API_TOKEN },
-    body: formDataFrom({ content })
-  })
-  if (!r.ok) throw new Error('Chatwoot text error: ' + await r.text())
-}
+const learnedFile = path.join(process.cwd(), 'learned.json')
+let LEARNED = fs.existsSync(learnedFile) ? JSON.parse(fs.readFileSync(learnedFile, 'utf8')) : []
+function saveLearned(){ fs.writeFileSync(learnedFile, JSON.stringify(LEARNED, null, 2)) }
 
-async function cwReplyAttachment(conversationId, { buffer, filename, mimeType, caption }) {
-  const fd = new FormData()
-  if (caption) fd.append('content', caption)
-  const blob = new Blob([buffer], { type: mimeType || 'application/octet-stream' })
-  fd.append('attachments[]', blob, filename || 'file')
-  const r = await fetch(CW_MSG_URL(conversationId), {
-    method: 'POST',
-    headers: { 'api_access_token': CHATWOOT_API_TOKEN },
-    body: fd
-  })
-  if (!r.ok) throw new Error('Chatwoot attach error: ' + await r.text())
-}
+const kbFile = path.join(process.cwd(), 'knowledge.json')
+let KB = fs.existsSync(kbFile) ? JSON.parse(fs.readFileSync(kbFile, 'utf8')) : []
 
-/* ================== KB simple ventas ================== */
-let KB = []
-const KB_PATH = new URL('./knowledge.json', import.meta.url).pathname
-function loadKB() { try { KB = JSON.parse(fs.readFileSync(KB_PATH,'utf-8')) } catch { KB = [] } }
-loadKB()
-
-function normalize(s) {
-  return (s || '').toLowerCase()
-    .normalize('NFD').replace(/\p{Diacritic}/gu,'')
+function norm(s=''){
+  return String(s).toLowerCase()
+    .normalize('NFD').replace(/\p{Diacritic}/gu, '')
     .replace(/[^a-z0-9\s]/g,' ')
-    .replace(/\s+/g,' ').trim()
+    .replace(/\s+/g, ' ').trim()
 }
-function tokenSet(str) { return new Set(normalize(str).split(' ').filter(Boolean)) }
+const wait = ms => new Promise(r => setTimeout(r, ms))
+
+async function fetchWithRetry(url, opts={}, { retries=2, timeoutMs=15000 } = {}) {
+  const controller = new AbortController()
+  const id = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    const res = await fetch(url, { ...opts, signal: controller.signal })
+    if (res.status >= 500 && retries > 0) {
+      await wait((3 - retries) * 300)
+      return fetchWithRetry(url, opts, { retries: retries - 1, timeoutMs })
+    }
+    return res
+  } catch (e) {
+    if (retries > 0) {
+      await wait((3 - retries) * 300)
+      return fetchWithRetry(url, opts, { retries: retries - 1, timeoutMs })
+    }
+    throw e
+  } finally { clearTimeout(id) }
+}
+function filenameFromUrl(u='') {
+  try { return decodeURIComponent(u.split('?')[0].split('/').pop() || 'file') }
+  catch { return 'file' }
+}
+function fileKind(u='') {
+  const x = (u || '').split('?')[0].toLowerCase()
+  if (!x) return 'text'
+  if (/\.(mp4|mov|webm|mkv)$/i.test(x)) return 'video'
+  if (/\.pdf$/i.test(x)) return 'pdf'
+  if (/\.webp$/i.test(x)) return 'sticker'
+  if (/\.(png|jpe?g|gif)$/i.test(x)) return 'image'
+  return 'text'
+}
+
+function tokenSet(str) { return new Set(norm(str).split(' ').filter(Boolean)) }
 function jaccard(a,b){ const A=tokenSet(a),B=tokenSet(b); const inter=[...A].filter(x=>B.has(x)).length; const uni=new Set([...A,...B]).size||1; return inter/uni }
-function findBestAnswer(userText) {
-  const t = userText || ''
-  const n = normalize(t)
-  let best = { score: 0, answer: null }
-  for (const item of KB) {
+
+const DAY = 24*60*60*1000
+function autoTtlDays(q, a){
+  const s = `${q} ${a}`.toLowerCase()
+  if (/\b(precio|usd|u\$d|dolar|dólar|\$|ars|cuota|financiaci[oó]n)\b/.test(s)) return PRICE_TTL_DAYS
+  return DEFAULT_TTL_DAYS
+}
+function isExpired(entry){
+  const now = Date.now()
+  if (entry.expired === true) return true
+  if (entry.expiresAt && now > Number(entry.expiresAt)) return true
+  return false
+}
+
+function bestFromList(text, list) {
+  let best = { score: 0, answer: null, source: null }
+  const n = norm(text)
+  for (const item of list) {
+    if (item.expired || isExpired(item)) continue
     let m = 0
     if (Array.isArray(item.patterns)) {
-      for (const rx of item.patterns) { try { if (new RegExp(rx, 'i').test(t)) m = Math.max(m, 0.9) } catch {} }
+      for (const rx of item.patterns) {
+        try { if (new RegExp(rx, 'i').test(text)) m = Math.max(m, 0.9) } catch {}
+      }
     }
     if (item.q) m = Math.max(m, jaccard(n, item.q))
-    if (m > best.score) best = { score: m, answer: item.a }
+    if (m > best.score) best = { score: m, answer: item.a, source: item.source || 'kb' }
   }
   return best
 }
+function findBestAnswer(text) {
+  const learnedScored = LEARNED.map(e => ({ q: e.q, a: e.a, source: 'learned', expiresAt: e.expiresAt, expired: e.expired }))
+  const A = bestFromList(text, learnedScored)
+  if (A.score >= 0.58) return A
+  const B = bestFromList(text, KB)
+  if (B.score >= 0.35) return B
+  return (A.score > B.score) ? A : B
+}
 
-/* ================== Baileys (WhatsApp) ================== */
+async function cwPostJSON(url, body) {
+  const r = await fetchWithRetry(url, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json', 'api_access_token': CW_TOKEN },
+    body: JSON.stringify(body || {})
+  })
+  const txt = await r.text()
+  if (!r.ok) throw new Error(`Chatwoot ${r.status}: ${txt}`)
+  return txt ? JSON.parse(txt) : {}
+}
+
+async function sendOutgoing(convId, text, attachments = []) {
+  if (/\[#CW\d+\]/.test(text || '')) text = ''
+  const url = `${CW_BASE}/conversations/${convId}/messages`
+  const atts = Array.isArray(attachments) ? attachments : (attachments ? [attachments] : [])
+  if (!atts.length) {
+    if (!text) return {}
+    return cwPostJSON(url, { content: text, message_type:'outgoing', private:false, content_type:'text' })
+  }
+  const max = 15 * 1024 * 1024
+  const form = new FormData()
+  form.append('content', text || '(adjunto)')
+  form.append('message_type', 'outgoing')
+  form.append('private', 'false')
+  for (const u of atts) {
+    try {
+      const h = await fetchWithRetry(u, { method:'HEAD' }, { timeoutMs: 8000 })
+      if (!h.ok) continue
+      const size = Number(h.headers.get('content-length') || '0')
+      if (size && size > max) {
+        await cwPostJSON(url, { content:`Archivo grande, descargalo aquí: ${u}`, message_type:'outgoing', private:false })
+        continue
+      }
+      const r = await fetchWithRetry(u, {}, { timeoutMs: 25000 })
+      if (!r.ok) continue
+      const buf = new Uint8Array(await r.arrayBuffer())
+      const type = r.headers.get('content-type') || 'application/octet-stream'
+      const blob = new Blob([buf], { type })
+      form.append('attachments[]', blob, filenameFromUrl(u))
+    } catch {}
+  }
+  const res = await fetchWithRetry(url, { method:'POST', headers: { 'api_access_token': CW_TOKEN }, body: form })
+  const txt = await res.text()
+  if (!res.ok) throw new Error(`Chatwoot ${res.status}: ${txt}`)
+  return txt ? JSON.parse(txt) : {}
+}
+async function sendPrivate(convId, text) {
+  const url = `${CW_BASE}/conversations/${convId}/messages`
+  return cwPostJSON(url, { content: text, message_type:'outgoing', private:true, content_type:'text' })
+}
+
+const convLocks = new Map()
+async function withConvLock(convId, fn) {
+  const prev = convLocks.get(convId) || Promise.resolve()
+  const next = prev.then(fn, fn)
+  convLocks.set(convId, next.catch(() => {}))
+  return next
+}
+
+/* ====== Baileys (Grupo) ====== */
 let sock = null
-let lastQR = null
-const lastConvBySupervisor = new Map() // digits -> conversationId
+let lastQR = { svg: null, png: null }
 
-function jidFromDigits(d){ return `${d}@s.whatsapp.net` }
+function isGroupJid(j){ return typeof j === 'string' && j.endsWith('@g.us') }
 
 async function startSock () {
-  const { state, saveCreds } = await useMultiFileAuthState('./auth')
+  const { state: auth, saveCreds } = await useMultiFileAuthState('./auth')
   const { version } = await fetchLatestBaileysVersion()
   sock = makeWASocket({
     version,
-    auth: state,
+    auth,
     printQRInTerminal: false,
-    browser: ['SalesBot','Chrome','1.0'],
+    browser: ['LunaBridge','Chrome','1.3'],
     markOnlineOnConnect: false,
     syncFullHistory: false
   })
@@ -127,10 +223,20 @@ async function startSock () {
   sock.ev.on('connection.update', async (u) => {
     const { connection, lastDisconnect, qr } = u
     if (qr) {
-      lastQR = {
-        svg: await QRCode.toString(qr, { type: 'svg' }),
-        png: await QRCode.toDataURL(qr, { margin: 1 })
-      }
+      lastQR.svg = await QRCode.toString(qr, { type: 'svg' })
+      lastQR.png = await QRCode.toDataURL(qr, { margin: 1 })
+    }
+    if (connection === 'open') {
+      try {
+        if (!isGroupJid(SUPERVISOR_GROUP) && SUPERVISOR_GROUP_LINK) {
+          const code = (SUPERVISOR_GROUP_LINK.split('/').pop() || '').trim()
+          if (code) {
+            const gid = await sock.groupAcceptInvite(code)
+            SUPERVISOR_GROUP = gid + '@g.us'
+            console.log('[GROUP] Joined via invite. JID:', SUPERVISOR_GROUP)
+          }
+        }
+      } catch (e) { console.warn('[GROUP] Invite join error:', e?.message || e) }
     }
     if (connection === 'close') {
       const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
@@ -138,33 +244,53 @@ async function startSock () {
     }
   })
 
-  // Inbound messages (supervisores → Chatwoot)
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  sock.ev.on('messages.upsert', async ({ messages }) => {
     for (const m of messages) {
       try {
         const from = m.key?.remoteJid || ''
-        const digits = onlyDigits(from)
-        if (!SUPS.has(digits)) continue // solo supervisores
+        if (from !== SUPERVISOR_GROUP) continue
 
-        // Texto / captions
         const txt = (
           m.message?.conversation ||
           m.message?.extendedTextMessage?.text ||
           m.message?.imageMessage?.caption ||
           m.message?.videoMessage?.caption ||
           ''
-        )
+        ).trim()
 
-        // Resolver conversación objetivo
+        let convId = null
         const tokenMatch = txt.match(/\[#CW(\d+)\]/)
-        let convId = tokenMatch?.[1] || lastConvBySupervisor.get(digits)
+        if (tokenMatch) convId = tokenMatch[1]
+        if (!convId) convId = state.__lastForwardConv || null
         if (!convId) continue
 
-        // Publicar texto
-        const clean = txt.replace(/\s*\[#CW\d+\]\s*/,'').trim()
-        if (clean) await cwReplyText(convId, `👤 Supervisor: ${clean}`)
+        if (txt.startsWith('+')) {
+          const ok = await handleSupervisorCommand({ txt, convId })
+          if (ok) continue
+        }
 
-        // Adjuntos (descargar y subir a Chatwoot)
+        const clean = txt.replace(/\s*\[#CW\d+\]\s*/,'').trim()
+        const c = touch(convId)
+        const now = Date.now()
+        const ANSWER_WINDOW = 60 * 1000
+        const already = c.answeredAt && (now - c.answeredAt) < ANSWER_WINDOW
+
+        if (clean) {
+          if (!already) {
+            const ttlDays = autoTtlDays(c.pendingQ?.text || clean, clean)
+            const expiresAt = Date.now() + ttlDays * DAY
+            LEARNED.push({ q: c.pendingQ?.text || clean, a: clean, at: Date.now(), source: 'supervisor', convId, group: SUPERVISOR_GROUP, expiresAt })
+            saveLearned()
+            await sendPrivate(convId, `📚 ${LUNA_NAME} aprendió: "${c.pendingQ?.text || '(n/a)'}" → "${clean}" (grupo)`)
+            await sendOutgoing(convId, `_${LUNA_NAME}: ${clean}_`)
+            c.pendingQ = null
+            c.answeredAt = now
+            saveState()
+          } else {
+            await sendPrivate(convId, `ℹ️ Otro supervisor agregó: "${clean}" (ignorado para evitar doble respuesta).`)
+          }
+        }
+
         const mm = m.message
         const types = ['imageMessage','videoMessage','documentMessage','audioMessage','stickerMessage']
         for (const t of types) {
@@ -177,114 +303,222 @@ async function startSock () {
           for await (const chunk of stream) buf = Buffer.concat([buf, chunk])
           const caption = mm[t]?.caption || ''
           const mimetype = mm[t]?.mimetype || 'application/octet-stream'
-          const filename = mm[t]?.fileName || `wa_${Date.now()}`
-          await cwReplyAttachment(convId, { buffer: buf, filename, mimeType: mimetype, caption })
+          const filename = mm[t]?.fileName || `wa_${Date.now()}.${mime.extension(mimetype) || 'bin'}`
+
+          const url = `${CW_BASE}/conversations/${convId}/messages`
+          const form = new FormData()
+          form.append('content', caption ? `_${LUNA_NAME}: ${caption}_` : `_${LUNA_NAME} envió un archivo_`)
+          form.append('message_type', 'outgoing')
+          form.append('private', 'false')
+          const blob = new Blob([buf], { type: mimetype })
+          form.append('attachments[]', blob, filename)
+          const res = await fetch(url, { method:'POST', headers: { 'api_access_token': CW_TOKEN }, body: form })
+          if (!res.ok) console.warn('Attach CW error:', await res.text())
         }
 
-        lastConvBySupervisor.set(digits, String(convId))
       } catch (e) {
-        console.error('Baileys upsert error:', e.message)
+        console.error('Group upsert error:', e.message)
       }
     }
   })
 }
+startSock().catch(e => console.error('Baileys init error:', e))
 
-async function waSendText(toDigits, text){
-  if (!sock) throw new Error('Baileys no inicializado')
-  await sock.sendMessage(jidFromDigits(toDigits), { text })
-}
-
-async function fetchBuffer(url){
-  const r = await fetch(url)
-  if (!r.ok) throw new Error('Fetch media failed: ' + r.status)
-  const arr = await r.arrayBuffer()
-  const ct = r.headers.get('content-type') || 'application/octet-stream'
-  let filename = path.basename(new URL(url).pathname || 'file')
-  if (!filename.includes('.')) {
-    const ext = mime.extension(ct) || 'bin'
-    filename = filename + '.' + ext
+async function forwardToGroup(convId, questionText, attachments=[]) {
+  if (!SUPERVISOR_GROUP) throw new Error('SUPERVISOR_GROUP no configurado')
+  const token = `[#CW${convId}]`
+  const header = `Consulta de ${BRAND_NAME} ${token}\nPregunta: ${questionText?.trim() || '(sin texto)'}`
+  await sock.sendMessage(SUPERVISOR_GROUP, { text: header })
+  for (const u of attachments) {
+    try {
+      const r = await fetchWithRetry(u, {}, { timeoutMs: 25000 })
+      if (!r.ok) continue
+      const buf = Buffer.from(await r.arrayBuffer())
+      const ct = r.headers.get('content-type') || 'application/octet-stream'
+      if (ct.startsWith('image/')) await sock.sendMessage(SUPERVISOR_GROUP, { image: buf, caption: filenameFromUrl(u) })
+      else if (ct.startsWith('video/')) await sock.sendMessage(SUPERVISOR_GROUP, { video: buf, caption: filenameFromUrl(u) })
+      else if (ct.startsWith('audio/')) await sock.sendMessage(SUPERVISOR_GROUP, { audio: buf, mimetype: ct, ptt: false })
+      else await sock.sendMessage(SUPERVISOR_GROUP, { document: buf, fileName: filenameFromUrl(u), mimetype: ct, caption: filenameFromUrl(u) })
+    } catch (e) { console.warn('Forward attach error:', e?.message || e) }
   }
-  return { buffer: Buffer.from(arr), mimeType: ct, filename }
+  state.__lastForwardConv = String(convId)
+  saveState()
 }
 
-async function waSendMediaFromUrl(toDigits, link, caption){
-  const { buffer, mimeType, filename } = await fetchBuffer(link)
-  const jid = jidFromDigits(toDigits)
-  if (mimeType.startsWith('image/')) {
-    await sock.sendMessage(jid, { image: buffer, caption })
-  } else if (mimeType.startsWith('video/')) {
-    await sock.sendMessage(jid, { video: buffer, caption })
-  } else if (mimeType.startsWith('audio/')) {
-    await sock.sendMessage(jid, { audio: buffer, mimetype: mimeType, ptt: false })
-  } else {
-    await sock.sendMessage(jid, { document: buffer, fileName: filename, mimetype: mimeType, caption })
-  }
-}
-
-/* ================== Chatwoot Webhook ================== */
-app.post('/webhook', async (req, res) => {
-  const raw = JSON.stringify(req.body)
-  const sig = req.headers['x-chatwoot-signature']
-  if (!hmacOk(raw, sig)) return res.status(401).end()
-  res.status(200).end()
-
-  const ev = req.body
-  const isIncoming = ev?.event === 'message_created' && ev?.message_type === 'incoming'
-  const conversationId = ev?.conversation?.id || ev?.message?.conversation_id
-  if (!isIncoming || !conversationId) return
-
-  const text = ev?.content || ''
-  const attachments = ev?.attachments || []
-
+function verifySignature(req, _res, next){
+  if (!WEBHOOK_SECRET) return next()
   try {
-    // 1) Intento KB
-    const { score, answer } = findBestAnswer(text)
-    if (score >= 0.35 && answer) {
-      await cwReplyText(conversationId, answer)
-      return
-    }
+    const sig = req.headers['x-chatwoot-signature'] || ''
+    const body = JSON.stringify(req.body || {})
+    const hmac = crypto.createHmac('sha256', WEBHOOK_SECRET).update(body).digest('hex')
+    if (sig !== hmac) { console.warn('[WARN] Firma inválida'); return next('route') }
+  } catch {}
+  next()
+}
 
-    // 2) Aviso + envío a supervisores por Baileys
-    await cwReplyText(conversationId, 'Estoy consultando con el equipo y te respondo enseguida.')
+function getMsgKey(ev, type){
+  const id = ev?.message?.id ?? ev?.id ?? ev?.message?.message_id ?? ev?.created_at ?? ''
+  const raw = (ev?.content || ev?.message?.content || '') + '|' + String(id) + '|' + type
+  return crypto.createHash('sha1').update(raw).digest('hex')
+}
+const ATAJO_COOLDOWN_MS = 8000
+function shouldFireAtajo(convState, type, key){
+  const last = convState.lastAtajo
+  const now = Date.now()
+  if (last && (last.key === key)) return false
+  if (last && last.type === type && (now - last.ts) < ATAJO_COOLDOWN_MS) return false
+  convState.lastAtajo = { type, ts: now, key }
+  return true
+}
 
-    const token = `[#CW${conversationId}]`
-    const header = `Consulta de ventas (${BRAND_NAME}) ${token}\nPregunta: ${text && text.trim().length ? text : '(mensaje sin texto)'}`
-    for (const sup of SUPS) {
-      if (!sup) continue
-      await waSendText(sup, header)
-      // reenviar adjuntos por URL → buffer
-      for (const a of attachments) {
-        const link = a?.data_url || a?.file_url || a?.thumb_url
-        if (!link) continue
-        const caption = a?.fallback_title || a?.file_name || ''
-        await waSendMediaFromUrl(sup, link, caption)
+async function tryAtajoMinimal(ev, convId, c, cmd){
+  if (cmd.includes('contactar asesor') || cmd.includes('continuar asesor')) {
+    const key = getMsgKey(ev, 'ASESOR')
+    if (!shouldFireAtajo(c, 'ASESOR', key)) return true
+    await sendOutgoing(convId, 'Perfecto, te atiende el asesor.')
+    await sendPrivate(convId, 'Asesor solicitado → activando puente Luna (grupo).')
+    c.supActive = true
+    saveState()
+    const raw = ev?.content || ev?.message?.content || ''
+    const attachments = (ev?.attachments || ev?.message?.attachments || []).map(a => a?.data_url || a?.file_url || a?.thumb_url).filter(Boolean)
+    await lunaAnswerOrAsk(convId, raw, attachments)
+    return true
+  }
+  return false
+}
+
+async function handleSupervisorCommand({ txt, convId }){
+  const cmd = txt.trim()
+  if (/^\+expiro\b/i.test(cmd)) {
+    let arg = cmd.replace(/^\+expiro\b/i,'').replace(/\[#CW\d+\]/,'').trim()
+    let count = 0
+    for (const e of LEARNED) {
+      const matchConv = String(e.convId || '') === String(convId)
+      const matchArg  = !arg || norm(e.q).includes(norm(arg))
+      if (matchConv && matchArg && !isExpired(e)) {
+        e.expired = true
+        e.expiresAt = Date.now() - 1
+        count++
       }
-      lastConvBySupervisor.set(sup, String(conversationId))
     }
+    saveLearned()
+    await sendPrivate(convId, `🗑️ Expirado(s) ${count} registro(s) por +expiro${arg?` ("${arg}")`:''}.`)
+    return true
+  }
+  return false
+}
+
+function findLearnedExact(text){
+  const n = norm(text || '')
+  return LEARNED.find(e => norm(e.q) === n && !isExpired(e))
+}
+async function lunaAnswerOrAsk(convId, rawText, attachments) {
+  const c = touch(convId)
+  c.supActive = true
+  saveState()
+
+  const exact = findLearnedExact(rawText || '')
+  if (exact && exact.a) {
+    await sendOutgoing(convId, `_${LUNA_NAME}: ${exact.a}_`)
+    await sendPrivate(convId, `✅ Respuesta aprendida usada (grupo)`)
+    return
+  }
+
+  const { score, answer, source } = findBestAnswer(rawText)
+  if (answer && (score >= 0.58 || (source !== 'learned' && score >= 0.35))) {
+    await sendOutgoing(convId, `_${LUNA_NAME}: ${answer}_`)
+    await sendPrivate(convId, `Luna respondió (${source}) con score=${score.toFixed(2)}.`)
+    return
+  }
+
+  await sendOutgoing(convId, `_${LUNA_NAME}: Estoy consultando con el equipo y te respondo al toque._`)
+  c.pendingQ = { text: rawText, ts: Date.now() }
+  c.answeredAt = 0
+  saveState()
+  await forwardToGroup(convId, rawText, attachments || [])
+  await sendPrivate(convId, `Consulta enviada al grupo de supervisores. Pregunta: "${rawText}"`)
+}
+
+app.post('/chatwoot/bot', verifySignature, async (req, res) => {
+  try {
+    const ev     = req.body
+    const convId = ev?.conversation?.id || ev?.id || ev?.message?.conversation_id
+    const tipo   = ev?.message_type || ev?.message?.message_type || 'incoming'
+    if (!convId || !tipo) return res.status(200).send('ok')
+
+    await withConvLock(String(convId), async () => {
+      const c   = touch(convId)
+      const raw = ev?.content || ev?.message?.content || ''
+      const cmd = norm(raw)
+
+      const fired = await tryAtajoMinimal(ev, convId, c, cmd)
+      if (fired) return
+
+      if (tipo === 'incoming' && c.supActive) {
+        const attachments = (ev?.attachments || ev?.message?.attachments || []).map(a => a?.data_url || a?.file_url || a?.thumb_url).filter(Boolean)
+        await lunaAnswerOrAsk(convId, raw, attachments)
+        return
+      }
+
+      await cwPostJSON(`${CW_BASE}/conversations/${convId}/messages`, {
+        content: `Hola, soy ${LUNA_NAME}. ¿Querés hablar con un asesor?`,
+        message_type: 'outgoing', private: false, content_type: 'text'
+      })
+    })
+
+    return res.status(200).send('ok')
   } catch (e) {
-    console.error(e)
-    await cwReplyText(conversationId, 'Se me complicó procesar eso. ¿Lo repetís breve?')
+    console.error('[BOT] Error:', e)
+    return res.status(200).send('ok')
   }
 })
 
-/* ================== QR endpoints ================== */
-app.get('/qr.svg', (req, res) => {
-  if (!lastQR?.svg) return res.status(404).send('QR no disponible. Esperando conexión...')
+app.post('/chatwoot/webhook', verifySignature, async (req, res) => {
+  try {
+    const ev     = req.body
+    const convId = ev?.conversation?.id || ev?.id || ev?.conversation_id || ev?.message?.conversation_id
+    if (!convId) return res.status(200).send('ok')
+
+    await withConvLock(String(convId), async () => {
+      const c   = touch(convId)
+      const raw = ev?.content || ev?.message?.content || ''
+      const cmd = norm(raw)
+
+      const fired = await tryAtajoMinimal(ev, convId, c, cmd)
+      if (fired) return
+
+      const tipo = ev?.message_type || ev?.message?.message_type || 'incoming'
+      const attachments = (ev?.attachments || ev?.message?.attachments || []).map(a => a?.data_url || a?.file_url || a?.thumb_url).filter(Boolean)
+
+      if (tipo === 'incoming' && c.supActive) {
+        await lunaAnswerOrAsk(convId, raw, attachments)
+      }
+    })
+
+    return res.status(200).send('ok')
+  } catch (e) {
+    console.error('[WEBHOOK] Error:', e)
+    return res.status(200).send('ok')
+  }
+})
+
+app.get('/qr.svg', (_req, res) => {
+  if (!lastQR.svg) return res.status(404).send('QR no disponible (esperá conexión)…')
   res.setHeader('Content-Type', 'image/svg+xml')
   res.send(lastQR.svg)
 })
-app.get('/qr.png', (req, res) => {
-  if (!lastQR?.png) return res.status(404).send('QR no disponible. Esperando conexión...')
+app.get('/qr.png', (_req, res) => {
+  if (!lastQR.png) return res.status(404).send('QR no disponible (esperá conexión)…')
   const b64 = lastQR.png.split(',')[1]
-  const buf = Buffer.from(b64, 'base64')
   res.setHeader('Content-Type', 'image/png')
-  res.send(buf)
+  res.send(Buffer.from(b64, 'base64'))
 })
 
-/* ================== Health ================== */
-app.get('/health', (_, res) => res.json({ ok: true, supervisors: [...SUPS], baileys: !!sock }))
+app.get('/healthz', (_req, res) => res.json({
+  ok:true, ts:Date.now(),
+  convs:Object.keys(state).length,
+  group: SUPERVISOR_GROUP || null
+}))
 
-/* ================== Boot ================== */
-const port = process.env.PORT || 8080
-app.listen(port, () => console.log('Sales Bot v4 (Baileys) listo en :' + port))
-startSock().catch(e => console.error('Baileys init error:', e))
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log(`BOT ${LUNA_NAME} listo :${PORT}, grupo=${SUPERVISOR_GROUP || 'unset'}`))
