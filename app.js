@@ -1,24 +1,34 @@
 \
-// app.js — Sales Bot v3: Chatwoot + Supervisores múltiples + Adjuntos 2‑vías (WhatsApp Cloud)
-// Node 18/20+ (fetch/FormData/Blob nativos)
+// app.js — Sales Bot v4: Chatwoot + Supervisores (Baileys) + Adjuntos 2‑vías + QR
+// Node 18/20+
+// - Webhook Chatwoot (ventas contra KB).
+// - Si no sabe responder → consulta a supervisores vía **Baileys**.
+// - Supervisores responden por WhatsApp y el bot publica en la conversación de Chatwoot.
+// - Adjuntos 2‑vías (cliente→supervisor y supervisor→Chatwoot).
+// - Emparejamiento QR: /qr.svg y /qr.png
 import 'dotenv/config'
 import express from 'express'
 import crypto from 'crypto'
 import fs from 'fs'
+import path from 'path'
+import mime from 'mime-types'
+import QRCode from 'qrcode'
+import makeWASocket, {
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  DisconnectReason,
+  downloadContentFromMessage
+} from '@whiskeysockets/baileys'
 
 const app = express()
-app.use(express.json({ limit: '10mb' }))
+app.use(express.json({ limit: '12mb' }))
 
 const {
   CHATWOOT_URL,
   CHATWOOT_ACCOUNT_ID,
   CHATWOOT_API_TOKEN,
   WEBHOOK_SECRET,
-  // WhatsApp Cloud API
-  WABA_PHONE_ID,
-  WABA_TOKEN,
-  WABA_VERIFY_TOKEN,
-  // Varios supervisores separados por coma. Ej: "5491172284607,5491122334455"
+  // Supervisores Baileys (coma, sin +, solo dígitos)
   SUPERVISORS = '',
   BRAND_NAME = 'Selfie Mirror'
 } = process.env
@@ -28,10 +38,10 @@ if (!CHATWOOT_URL || !CHATWOOT_ACCOUNT_ID || !CHATWOOT_API_TOKEN) {
   process.exit(1)
 }
 
-function onlyDigits(s) { return (s || '').replace(/\D+/g,'') }
+function onlyDigits (s) { return (s || '').replace(/\D+/g,'') }
 const SUPS = new Set( SUPERVISORS.split(',').map(s => onlyDigits(s)).filter(Boolean) )
 
-// ===== Chatwoot helpers
+/* ================== Chatwoot helpers ================== */
 const hmacOk = (raw, sig) => {
   if (!WEBHOOK_SECRET) return true
   if (!sig) return false
@@ -40,15 +50,6 @@ const hmacOk = (raw, sig) => {
 }
 const CW_MSG_URL = (conversationId) =>
   `${CHATWOOT_URL}/api/v1/accounts/${CHATWOOT_ACCOUNT_ID}/conversations/${conversationId}/messages`
-
-async function cwReplyText(conversationId, content) {
-  const r = await fetch(CW_MSG_URL(conversationId), {
-    method: 'POST',
-    headers: { 'api_access_token': CHATWOOT_API_TOKEN },
-    body: formDataFrom({ content }) // usar multipart por compat con adjuntos
-  })
-  if (!r.ok) throw new Error('Chatwoot text error: ' + await r.text())
-}
 
 function formDataFrom(fields) {
   const fd = new FormData()
@@ -59,11 +60,20 @@ function formDataFrom(fields) {
   return fd
 }
 
-// Subir adjunto binario a Chatwoot
-async function cwReplyAttachment(conversationId, { buffer, filename, mime, caption }) {
+async function cwReplyText(conversationId, content) {
+  const r = await fetch(CW_MSG_URL(conversationId), {
+    method: 'POST',
+    headers: { 'api_access_token': CHATWOOT_API_TOKEN },
+    body: formDataFrom({ content })
+  })
+  if (!r.ok) throw new Error('Chatwoot text error: ' + await r.text())
+}
+
+async function cwReplyAttachment(conversationId, { buffer, filename, mimeType, caption }) {
   const fd = new FormData()
   if (caption) fd.append('content', caption)
-  fd.append('attachments[]', new Blob([buffer], { type: mime || 'application/octet-stream' }), filename || 'file')
+  const blob = new Blob([buffer], { type: mimeType || 'application/octet-stream' })
+  fd.append('attachments[]', blob, filename || 'file')
   const r = await fetch(CW_MSG_URL(conversationId), {
     method: 'POST',
     headers: { 'api_access_token': CHATWOOT_API_TOKEN },
@@ -72,7 +82,7 @@ async function cwReplyAttachment(conversationId, { buffer, filename, mime, capti
   if (!r.ok) throw new Error('Chatwoot attach error: ' + await r.text())
 }
 
-// ===== KB simple (ventas)
+/* ================== KB simple ventas ================== */
 let KB = []
 const KB_PATH = new URL('./knowledge.json', import.meta.url).pathname
 function loadKB() { try { KB = JSON.parse(fs.readFileSync(KB_PATH,'utf-8')) } catch { KB = [] } }
@@ -101,53 +111,125 @@ function findBestAnswer(userText) {
   return best
 }
 
-// ===== WhatsApp Cloud helpers
-const WABA_BASE = `https://graph.facebook.com/v21.0`
-const WABA_MSG_URL = `${WABA_BASE}/${WABA_PHONE_ID}/messages`
+/* ================== Baileys (WhatsApp) ================== */
+let sock = null
+let lastQR = null
+const lastConvBySupervisor = new Map() // digits -> conversationId
 
-async function wabaSendText(toDigits, body) {
-  if (!WABA_PHONE_ID || !WABA_TOKEN) return false
-  const r = await fetch(WABA_MSG_URL, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${WABA_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messaging_product:'whatsapp', to: toDigits, type:'text', text:{ body } })
+function jidFromDigits(d){ return `${d}@s.whatsapp.net` }
+
+async function startSock () {
+  const { state, saveCreds } = await useMultiFileAuthState('./auth')
+  const { version } = await fetchLatestBaileysVersion()
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: false,
+    browser: ['SalesBot','Chrome','1.0'],
+    markOnlineOnConnect: false,
+    syncFullHistory: false
   })
-  return r.ok
-}
 
-// Enviar media por **link** (más simple que subir id)
-async function wabaSendMediaLink(toDigits, kind, link, caption) {
-  if (!WABA_PHONE_ID || !WABA_TOKEN) return false
-  const payload = { messaging_product:'whatsapp', to: toDigits, type: kind }
-  payload[kind] = { link }
-  if (caption && (kind==='image' || kind==='video' || kind==='document')) payload[kind].caption = caption
-  const r = await fetch(WABA_MSG_URL, {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${WABA_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+  sock.ev.on('creds.update', saveCreds)
+
+  sock.ev.on('connection.update', async (u) => {
+    const { connection, lastDisconnect, qr } = u
+    if (qr) {
+      lastQR = {
+        svg: await QRCode.toString(qr, { type: 'svg' }),
+        png: await QRCode.toDataURL(qr, { margin: 1 })
+      }
+    }
+    if (connection === 'close') {
+      const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut
+      if (shouldReconnect) setTimeout(startSock, 3000)
+    }
   })
-  if (!r.ok) console.error('WABA media link error:', await r.text())
-  return r.ok
+
+  // Inbound messages (supervisores → Chatwoot)
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    for (const m of messages) {
+      try {
+        const from = m.key?.remoteJid || ''
+        const digits = onlyDigits(from)
+        if (!SUPS.has(digits)) continue // solo supervisores
+
+        // Texto / captions
+        const txt = (
+          m.message?.conversation ||
+          m.message?.extendedTextMessage?.text ||
+          m.message?.imageMessage?.caption ||
+          m.message?.videoMessage?.caption ||
+          ''
+        )
+
+        // Resolver conversación objetivo
+        const tokenMatch = txt.match(/\[#CW(\d+)\]/)
+        let convId = tokenMatch?.[1] || lastConvBySupervisor.get(digits)
+        if (!convId) continue
+
+        // Publicar texto
+        const clean = txt.replace(/\s*\[#CW\d+\]\s*/,'').trim()
+        if (clean) await cwReplyText(convId, `👤 Supervisor: ${clean}`)
+
+        // Adjuntos (descargar y subir a Chatwoot)
+        const mm = m.message
+        const types = ['imageMessage','videoMessage','documentMessage','audioMessage','stickerMessage']
+        for (const t of types) {
+          if (!mm?.[t]) continue
+          const kind = t.replace('Message','')
+          const stream = await downloadContentFromMessage(mm[t], kind.startsWith('image') ? 'image' :
+                                                               kind.startsWith('video') ? 'video' :
+                                                               kind.startsWith('audio') ? 'audio' : 'document')
+          let buf = Buffer.from([])
+          for await (const chunk of stream) buf = Buffer.concat([buf, chunk])
+          const caption = mm[t]?.caption || ''
+          const mimetype = mm[t]?.mimetype || 'application/octet-stream'
+          const filename = mm[t]?.fileName || `wa_${Date.now()}`
+          await cwReplyAttachment(convId, { buffer: buf, filename, mimeType: mimetype, caption })
+        }
+
+        lastConvBySupervisor.set(digits, String(convId))
+      } catch (e) {
+        console.error('Baileys upsert error:', e.message)
+      }
+    }
+  })
 }
 
-// Descargar media recibido desde WABA (id -> url -> binario)
-async function wabaDownloadMedia(mediaId) {
-  const meta1 = await fetch(`${WABA_BASE}/${mediaId}`, { headers: { 'Authorization': `Bearer ${WABA_TOKEN}` } })
-  if (!meta1.ok) throw new Error('WABA media meta error')
-  const meta = await meta1.json()
-  const url = meta.url
-  const blob = await (await fetch(url, { headers: { 'Authorization': `Bearer ${WABA_TOKEN}` } })).blob()
-  const arrayBuffer = await blob.arrayBuffer()
-  return { buffer: Buffer.from(arrayBuffer), mime: blob.type || 'application/octet-stream', filename: meta?.file_name || `waba_${mediaId}` }
+async function waSendText(toDigits, text){
+  if (!sock) throw new Error('Baileys no inicializado')
+  await sock.sendMessage(jidFromDigits(toDigits), { text })
 }
 
-// Track último conversationId por supervisor
-const lastConvBySupervisor = new Map()
+async function fetchBuffer(url){
+  const r = await fetch(url)
+  if (!r.ok) throw new Error('Fetch media failed: ' + r.status)
+  const arr = await r.arrayBuffer()
+  const ct = r.headers.get('content-type') || 'application/octet-stream'
+  let filename = path.basename(new URL(url).pathname || 'file')
+  if (!filename.includes('.')) {
+    const ext = mime.extension(ct) || 'bin'
+    filename = filename + '.' + ext
+  }
+  return { buffer: Buffer.from(arr), mimeType: ct, filename }
+}
 
-function tagForConv(conversationId){ return `[#CW${conversationId}]` }
-function extractTaggedConvId(text){ const m = (text||'').match(/\[#CW(\d+)\]/); return m?.[1] }
+async function waSendMediaFromUrl(toDigits, link, caption){
+  const { buffer, mimeType, filename } = await fetchBuffer(link)
+  const jid = jidFromDigits(toDigits)
+  if (mimeType.startsWith('image/')) {
+    await sock.sendMessage(jid, { image: buffer, caption })
+  } else if (mimeType.startsWith('video/')) {
+    await sock.sendMessage(jid, { video: buffer, caption })
+  } else if (mimeType.startsWith('audio/')) {
+    await sock.sendMessage(jid, { audio: buffer, mimetype: mimeType, ptt: false })
+  } else {
+    await sock.sendMessage(jid, { document: buffer, fileName: filename, mimetype: mimeType, caption })
+  }
+}
 
-// ===== Chatwoot webhook (cliente → bot)
+/* ================== Chatwoot Webhook ================== */
 app.post('/webhook', async (req, res) => {
   const raw = JSON.stringify(req.body)
   const sig = req.headers['x-chatwoot-signature']
@@ -163,37 +245,29 @@ app.post('/webhook', async (req, res) => {
   const attachments = ev?.attachments || []
 
   try {
-    // 1) Probar KB
+    // 1) Intento KB
     const { score, answer } = findBestAnswer(text)
     if (score >= 0.35 && answer) {
       await cwReplyText(conversationId, answer)
       return
     }
 
-    // 2) Avisar al cliente y enviar consulta + adjuntos al/los supervisores
+    // 2) Aviso + envío a supervisores por Baileys
     await cwReplyText(conversationId, 'Estoy consultando con el equipo y te respondo enseguida.')
 
-    const token = tagForConv(conversationId)
-    const question = (text && text.trim().length) ? text : '(mensaje sin texto)'
-    const header = `Consulta de ventas (${BRAND_NAME}) ${token}\nPregunta: ${question}`
-
+    const token = `[#CW${conversationId}]`
+    const header = `Consulta de ventas (${BRAND_NAME}) ${token}\nPregunta: ${text && text.trim().length ? text : '(mensaje sin texto)'}`
     for (const sup of SUPS) {
-      if (sup) {
-        await wabaSendText(sup, header)
-        // reenviar adjuntos del cliente al supervisor por **link** si Chatwoot nos da data_url/file_url
-        for (const a of attachments) {
-          const link = a?.data_url || a?.file_url || a?.thumb_url
-          if (!link) continue
-          const mime = (a?.file_type || '').toLowerCase()
-          let kind = null
-          if (mime.startsWith('image/')) kind = 'image'
-          else if (mime.startsWith('video/')) kind = 'video'
-          else if (mime.startsWith('audio/')) kind = 'audio'
-          else kind = 'document'
-          await wabaSendMediaLink(sup, kind, link, a?.fallback_title || a?.file_name || '')
-        }
+      if (!sup) continue
+      await waSendText(sup, header)
+      // reenviar adjuntos por URL → buffer
+      for (const a of attachments) {
+        const link = a?.data_url || a?.file_url || a?.thumb_url
+        if (!link) continue
+        const caption = a?.fallback_title || a?.file_name || ''
+        await waSendMediaFromUrl(sup, link, caption)
       }
-      if (sup) lastConvBySupervisor.set(sup, String(conversationId))
+      lastConvBySupervisor.set(sup, String(conversationId))
     }
   } catch (e) {
     console.error(e)
@@ -201,60 +275,24 @@ app.post('/webhook', async (req, res) => {
   }
 })
 
-// ===== WABA webhook (supervisor → bot → Chatwoot)
-app.get('/waba', (req, res) => {
-  const mode = req.query['hub.mode']
-  const token = req.query['hub.verify_token']
-  const challenge = req.query['hub.challenge']
-  if (mode === 'subscribe' && token && token === WABA_VERIFY_TOKEN) return res.status(200).send(challenge)
-  return res.status(403).send('forbidden')
+/* ================== QR endpoints ================== */
+app.get('/qr.svg', (req, res) => {
+  if (!lastQR?.svg) return res.status(404).send('QR no disponible. Esperando conexión...')
+  res.setHeader('Content-Type', 'image/svg+xml')
+  res.send(lastQR.svg)
+})
+app.get('/qr.png', (req, res) => {
+  if (!lastQR?.png) return res.status(404).send('QR no disponible. Esperando conexión...')
+  const b64 = lastQR.png.split(',')[1]
+  const buf = Buffer.from(b64, 'base64')
+  res.setHeader('Content-Type', 'image/png')
+  res.send(buf)
 })
 
-app.post('/waba', async (req, res) => {
-  res.sendStatus(200)
-  try {
-    const entry = req.body?.entry?.[0]?.changes?.[0]?.value
-    const messages = entry?.messages || []
-    for (const m of messages) {
-      const fromDigits = onlyDigits(m.from)
-      // filtrar solo supervisores configurados
-      if (!SUPS.has(fromDigits)) continue
+/* ================== Health ================== */
+app.get('/health', (_, res) => res.json({ ok: true, supervisors: [...SUPS], baileys: !!sock }))
 
-      // elegir conversación destino
-      const textBody = m.text?.body || ''
-      let convId = extractTaggedConvId(textBody) || lastConvBySupervisor.get(fromDigits)
-      if (!convId) continue
-
-      // Texto
-      if (textBody) {
-        const clean = textBody.replace(/\s*\[#CW\d+\]\s*/,'').trim()
-        if (clean) await cwReplyText(convId, `👤 Supervisor: ${clean}`)
-      }
-
-      // Media
-      const type = m.type
-      if (type === 'image' || type === 'video' || type === 'audio' || type === 'document' || type === 'sticker') {
-        const mediaId = m[type]?.id
-        if (mediaId) {
-          try {
-            const media = await wabaDownloadMedia(mediaId)
-            const caption = m[type]?.caption || ''
-            await cwReplyAttachment(convId, { ...media, caption })
-          } catch (e) {
-            await cwReplyText(convId, `👤 Supervisor envió un adjunto, pero no pude descargarlo (${e.message}).`)
-          }
-        }
-      }
-
-      // update last conversation for that supervisor
-      lastConvBySupervisor.set(fromDigits, String(convId))
-    }
-  } catch (e) {
-    console.error('WABA inbound error:', e.message)
-  }
-})
-
-app.get('/health', (_, res) => res.json({ ok: true, supervisors: [...SUPS] }))
-
+/* ================== Boot ================== */
 const port = process.env.PORT || 8080
-app.listen(port, () => console.log('Sales Bot v3 listo en :' + port))
+app.listen(port, () => console.log('Sales Bot v4 (Baileys) listo en :' + port))
+startSock().catch(e => console.error('Baileys init error:', e))

@@ -1,42 +1,40 @@
-# Sales Bot v3 — Multi‑supervisor + Adjuntos 2‑vías
+# Sales Bot v4 — Baileys (Supervisor por WhatsApp) + Adjuntos 2‑vías + QR
 
-✅ Responde ventas desde `knowledge.json`.
+## Qué hace
+- Responde ventas desde `knowledge.json`.
+- Si no sabe, **consulta a supervisores** vía **Baileys**.
+- Los supervisores responden por WhatsApp y el bot publica en **Chatwoot**.
+- Soporta **adjuntos 2‑vías** (cliente ↔ supervisor).
+- Emparejamiento por **QR** en `/qr.svg` o `/qr.png`.
 
-✅ Si no sabe, consulta a **todos** los `SUPERVISORS` vía WhatsApp (Cloud API) con etiqueta `[#CW<conversationId>]`.
-
-✅ Los supervisores responden por WhatsApp (texto y **adjuntos**), y el bot los publica en la conversación de **Chatwoot**.
-
-✅ Si el cliente manda **adjuntos** en Chatwoot, se reenvían al supervisor por **link**.
-
-
-## Setup
-1) `.env` con `CHATWOOT_*`, `WABA_*`, y `SUPERVISORS` (comma‑separated, sin +).
-
-2) Meta → Webhook de WhatsApp Cloud:
-
-   - Callback: `https://TU_HOST/waba`
-
-   - Verify token: `WABA_VERIFY_TOKEN`
-
-   - Eventos: **messages**
-
-3) Chatwoot → Webhooks
-
-   - URL: `https://TU_HOST/webhook`
-
+## Arranque
+1) `cp .env.example .env` y completá `CHATWOOT_*` y `SUPERVISORS` (sin +).
+2) `npm i`
+3) `node app.js`
+4) Abrí `http://localhost:8080/qr.svg` para escanear el QR y vincular.
+5) En Chatwoot → Webhooks:
+   - URL: `http://TU_HOST:8080/webhook`
    - Evento: **message_created**
+   - (Opcional) firma con `WEBHOOK_SECRET`.
 
-4) `npm i && node app.js` (o Docker).
+## Flujo
+- El bot busca respuesta en KB (regex + similitud). Umbral 0.35.
+- Si no hay match: avisa en Chatwoot y envía mensaje a TODOS los `SUPERVISORS` con etiqueta `[#CW<conversationId>]`.
+- Cuando el supervisor escribe (o envía media), el bot inyecta en la conversación correspondiente.
+  - Si el texto contiene `[#CWid]` se enruta a ese id.
+  - Si no, se enruta a la **última conversación pendiente** de ese supervisor.
 
+## Adjuntos
+- Cliente → Supervisor: el bot toma `data_url/file_url` del webhook y los reenvía descargando el archivo y mandándolo por Baileys.
+- Supervisor → Chatwoot: el bot descarga con `downloadContentFromMessage` y sube como `attachments[]` (multipart).
 
-## Notas técnicas
-- Envío al supervisor: texto (`/messages` type=`text`) y media por **link** (image/video/audio/document). Ver WhatsApp Cloud docs.
+## Persistencia
+- Baileys usa `./auth/` (multi-file). **Montá volumen** si usás Docker.
 
-- Descarga de media entrante del supervisor: media **id → url → binario** y subida a Chatwoot como `attachments[]` en **multipart/form-data**.
+## Docker
+```bash
+docker build -t sales-bot-v4 .
+docker run -p 8080:8080 -v $(pwd)/auth:/app/auth --env-file .env sales-bot-v4
+```
 
-- El bot enruta por etiqueta `[#CWid]` o por la **última conversación pendiente** de ese número.
-
-- Ajustá `knowledge.json` con tu info real (precio, seña, entrega, etc.).
-
-
-Listo para producción básica. 🚀
+Listo para iterar. 🚀
