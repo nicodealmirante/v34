@@ -1,11 +1,3 @@
-\
-// app.js — Sales Bot v4: Chatwoot + Supervisores (Baileys) + Adjuntos 2‑vías + QR
-// Node 18/20+
-// - Webhook Chatwoot (ventas contra KB).
-// - Si no sabe responder → consulta a supervisores vía **Baileys**.
-// - Supervisores responden por WhatsApp y el bot publica en la conversación de Chatwoot.
-// - Adjuntos 2‑vías (cliente→supervisor y supervisor→Chatwoot).
-// - Emparejamiento QR: /qr.svg y /qr.png
 import 'dotenv/config'
 import express from 'express'
 import crypto from 'crypto'
