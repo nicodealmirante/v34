@@ -1,5 +1,4 @@
-\
-/* app.js — Luna + Grupo de Supervisores (Baileys) v1.3 */
+
 import express from 'express'
 import crypto from 'crypto'
 import fs from 'fs'
